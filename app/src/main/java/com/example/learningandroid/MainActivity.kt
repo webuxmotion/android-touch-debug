@@ -408,6 +408,44 @@ fun TouchDebugScreen() {
             }
         }
 
+        // Floating action button for weather reload
+        FloatingActionButton(
+            onClick = {
+                scope.launch {
+                    weatherText = "Reloading..."
+                    mainActivity?.let { main ->
+                        // Get current location
+                        val location = getCurrentLocation(context, main.fusedLocationClient)
+
+                        if (location != null) {
+                            val (lat, lon) = location
+
+                            // Get city name from coordinates
+                            cityName = getCityName(context, lat, lon)
+
+                            // Fetch weather for current location
+                            val weather = fetchWeather(lat.toFloat(), lon.toFloat())
+                            weatherText = weather?.let {
+                                "$cityName: ${it.current_weather.temperature}°C, Wind: ${it.current_weather.windspeed} km/h"
+                            } ?: "Failed to load weather for $cityName"
+                        } else {
+                            weatherText = "Location permission denied or unavailable"
+                        }
+                    }
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 110.dp),
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        ) {
+            Text(
+                text = "🌤️",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+
         // Floating action button for flashlight control
         FloatingActionButton(
             onClick = {
