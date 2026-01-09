@@ -1,17 +1,21 @@
 package com.example.learningandroid
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.location.Geocoder
 import android.os.Build
 import android.os.Bundle
-import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.Canvas
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,9 +30,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,6 +45,22 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.example.learningandroid.ui.theme.LearningAndroidTheme
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
+import io.ktor.client.HttpClient
+import io.ktor.client.call.body
+import io.ktor.client.engine.android.Android
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.get
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import java.util.Locale
 import kotlin.random.Random
 
 // Step 1: Data class to represent each touch point
@@ -47,10 +69,46 @@ data class TouchPoint(
     val position: Offset // X and Y coordinates
 )
 
+// Weather API data classes for Open-Meteo
+@Serializable
+data class WeatherResponse(
+    val latitude: Float,
+    val longitude: Float,
+    val current_weather: CurrentWeather
+)
+
+@Serializable
+data class CurrentWeather(
+    val temperature: Float,
+    val windspeed: Float,
+    val weathercode: Int
+)
+
 class MainActivity : ComponentActivity() {
+    lateinit var fusedLocationClient: FusedLocationProviderClient
+    private var hasLocationPermission = false
+
+    private val locationPermissionRequest = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasLocationPermission = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
+        // Request location permissions
+        locationPermissionRequest.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            )
+        )
+
         setContent {
             LearningAndroidTheme {
                 TouchDebugScreen()
@@ -59,12 +117,91 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// HTTP Client for API calls
+val httpClient = HttpClient(Android) {
+    install(ContentNegotiation) {
+        json(Json {
+            ignoreUnknownKeys = true
+        })
+    }
+}
+
+// Function to fetch weather using Open-Meteo (free, no API key required)
+suspend fun fetchWeather(latitude: Float = 51.5074f, longitude: Float = -0.1278f): WeatherResponse? {
+    return try {
+        // Open-Meteo API - completely free, no API key required
+        httpClient.get("https://api.open-meteo.com/v1/forecast?latitude=$latitude&longitude=$longitude&current_weather=true").body()
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
+// Function to get city name from coordinates using Geocoder
+fun getCityName(context: Context, latitude: Double, longitude: Double): String {
+    return try {
+        val geocoder = Geocoder(context, Locale.getDefault())
+        val addresses = geocoder.getFromLocation(latitude, longitude, 1)
+        if (addresses != null && addresses.isNotEmpty()) {
+            val address = addresses[0]
+            // Try to get city name, fallback to locality or subadmin area
+            address.locality ?: address.subAdminArea ?: address.adminArea ?: "Unknown Location"
+        } else {
+            "Unknown Location"
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        "Location unavailable"
+    }
+}
+
+// Function to get current location
+suspend fun getCurrentLocation(
+    context: Context,
+    fusedLocationClient: FusedLocationProviderClient
+): Pair<Double, Double>? {
+    return try {
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return null
+        }
+
+        suspendCancellableCoroutine { continuation ->
+            val cancellationTokenSource = CancellationTokenSource()
+            fusedLocationClient.getCurrentLocation(
+                Priority.PRIORITY_HIGH_ACCURACY,
+                cancellationTokenSource.token
+            ).addOnSuccessListener { location ->
+                continuation.resume(location?.let { Pair(it.latitude, it.longitude) })
+            }.addOnFailureListener {
+                continuation.resume(null)
+            }
+
+            continuation.invokeOnCancellation {
+                cancellationTokenSource.cancel()
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
 @Composable
 fun TouchDebugScreen() {
     // Get CameraManager from system services
     val context = LocalContext.current
     val activity = context as? Activity
+    val mainActivity = activity as? MainActivity
     val cameraManager = remember { context.getSystemService(Context.CAMERA_SERVICE) as CameraManager }
+    val scope = rememberCoroutineScope()
 
     // Get the back camera ID (usually has flash)
     val cameraId = remember {
@@ -90,6 +227,31 @@ fun TouchDebugScreen() {
     var isFlashlightOn by remember { mutableStateOf(false) }
     var brightness by remember { mutableStateOf(1.0f) } // Screen brightness: 0.0 to 1.0
     var flashlightStrength by remember { mutableStateOf(1) } // Flashlight intensity: 1 to max
+    var weatherText by remember { mutableStateOf("Loading location...") }
+    var cityName by remember { mutableStateOf("") }
+
+    // Fetch current location and weather on start
+    LaunchedEffect(Unit) {
+        mainActivity?.let { main ->
+            // Get current location
+            val location = getCurrentLocation(context, main.fusedLocationClient)
+
+            if (location != null) {
+                val (lat, lon) = location
+
+                // Get city name from coordinates
+                cityName = getCityName(context, lat, lon)
+
+                // Fetch weather for current location
+                val weather = fetchWeather(lat.toFloat(), lon.toFloat())
+                weatherText = weather?.let {
+                    "$cityName: ${it.current_weather.temperature}°C, Wind: ${it.current_weather.windspeed} km/h"
+                } ?: "Failed to load weather for $cityName"
+            } else {
+                weatherText = "Location permission denied or unavailable"
+            }
+        }
+    }
 
     // Clean up flashlight when composable is disposed
     DisposableEffect(Unit) {
@@ -186,6 +348,15 @@ fun TouchDebugScreen() {
                 .fillMaxWidth()
                 .padding(16.dp)
         ) {
+            // Weather display
+            Text(
+                text = weatherText,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+
             // Screen brightness slider
             Text(
                 text = "Screen: ${(brightness * 100).toInt()}%",
@@ -263,7 +434,7 @@ fun TouchDebugScreen() {
             },
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(16.dp),
+                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 46.dp),
             containerColor = if (isFlashlightOn) Color.Yellow else MaterialTheme.colorScheme.primaryContainer
         ) {
             Text(
